@@ -113,7 +113,40 @@ be rerun after the bitmap change with a longer measurement duration.
 Do not use these numbers as universal engine-performance claims. They describe
 this implementation and the recorded x86 Release environment.
 
-| V2.2 | Preallocated order pool and intrusive lists | Pending | Pending | Not implemented |
+
+## V2.2 — Flat price array with occupancy bitmap
+
+### Method
+
+- Build type: Release
+- Architecture: x86
+- Operations per batch: 2,000
+- Repetitions: 5
+- Workloads: balanced, crossing-heavy, cancel-heavy
+- Measurement: median throughput from Google Benchmark
+
+### Results
+
+| Workload | V1 median (ops/s) | V2.2 median (ops/s) | Speedup |
+|---|---:|---:|---:|
+| Balanced | 4.776M | 7.111M | 1.49x |
+| Crossing-heavy | 4.507M | 4.923M | 1.09x |
+| Cancel-heavy | 5.213M | 7.529M | 1.44x |
+
+### Interpretation
+
+The flat array and bitmap combination shows promising throughput gains
+on balanced and cancel-heavy synthetic workloads. The crossing-heavy
+regression observed in V2.1 is no longer present in this run.
+
+However, V2.2's coefficient of variation is high across all three workloads.
+The results are therefore preliminary and require further repeatability
+checks before being used as definitive performance claims.
+
+The bitmap lets the engine skip groups of empty price slots when locating
+the next occupied level. The experiment changes price-level search while
+retaining list-based order storage and the unordered ID index.
+
 | V2.3 | Bitmap for non-empty levels | Pending | Pending | Not implemented |
 | V2.4 | Flat open-addressing ID map | Pending | Pending | Not implemented |
 | V2.5 | Generation counters on handles | Pending | Pending | Not implemented |

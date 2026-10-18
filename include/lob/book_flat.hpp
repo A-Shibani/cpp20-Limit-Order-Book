@@ -4,6 +4,7 @@
 #include "lob/events.hpp"
 #include "lob/types.hpp"
 
+#include <bit>
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -72,10 +73,21 @@ public:
     // For the default range [1, 65535], each side has 65,535 Level
     // objects. The vectors do not grow as orders arrive; only the lists
     // and ID index allocate dynamically in this version.
+
+    // Allocate the price levels and one bitmap bit per configured price.
+    // Each uint64_t stores the occupancy of 64 consecutive levels.
     explicit BookFlat(PriceRange range = {})
         : range_(range),
           bids_(checked_level_count(range)),
-          asks_(checked_level_count(range)) {
+          asks_(checked_level_count(range)),
+          bid_bitmap_(
+              checked_bitmap_word_count(range),
+              std::uint64_t{0}
+          ),
+          ask_bitmap_(
+              checked_bitmap_word_count(range),
+              std::uint64_t{0}
+          ) {
     }
 
     // Submit either a limit order or a market order.
@@ -355,8 +367,10 @@ public:
             const std::vector<Level>& levels = levels_for(handle.side);
             const Level& level = levels[index_for(handle.price)];
 
-            // Every indexed order must point into a non-empty active level.
-            if (!level.active || level.orders.empty()) {
+            // The ID index, level state and bitmap must all agree.
+            if (!level.active
+                || level.orders.empty()
+                || !level_bit_is_set(handle.side, index_for(handle.price))) {
                 return false;
             }
 
@@ -468,6 +482,26 @@ public:
             }
         }
 
+        // Count set bits across both sides. Each occupied price level must have
+        // exactly one set bit, so the count must equal active_level_count_.
+        std::size_t bitmap_bit_count = 0;
+
+        for (const std::uint64_t word : bid_bitmap_) {
+            bitmap_bit_count += static_cast<std::size_t>(
+                std::popcount(word)
+            );
+        }
+
+        for (const std::uint64_t word : ask_bitmap_) {
+            bitmap_bit_count += static_cast<std::size_t>(
+                std::popcount(word)
+            );
+        }
+
+        if (bitmap_bit_count != active_level_count_) {
+            return false;
+        }
+
         // These checks detect missing index entries, extra index entries,
         // or occupied levels that aren't accounted for by the index.
         if (counted_orders != order_index_.size()
@@ -508,12 +542,26 @@ private:
             + 1U;
     }
 
+        // Round the number of levels up to the number of required 64-bit words.
+    // This division-and-remainder form avoids overflowing count + 63.
+    [[nodiscard]]
+    static std::size_t checked_bitmap_word_count(PriceRange range) {
+        const std::size_t count = checked_level_count(range);
+
+        return count / 64U + (count % 64U == 0U ? 0U : 1U);
+    }
+
     PriceRange range_;
 
     // Each vector is a fixed flat array once the constructor completes.
     // A price maps directly to one Level using index_for(price).
     std::vector<Level> bids_;
     std::vector<Level> asks_;
+
+    // A set bit means its corresponding price level is occupied.
+    // Bitmaps use much less memory than another full Level array would.
+    std::vector<std::uint64_t> bid_bitmap_;
+    std::vector<std::uint64_t> ask_bitmap_;
 
     // Average O(1) ID lookup under normal hash-table conditions.
     OrderIndex order_index_;
@@ -551,6 +599,66 @@ private:
     // Read-only access for validation and query operations.
     const std::vector<Level>& levels_for(Side side) const noexcept {
         return side == Side::Buy ? bids_ : asks_;
+    }
+
+    // Return the bitmap for the requested side.
+    // Buy orders use bid_bitmap_; sell orders use ask_bitmap_.
+    std::vector<std::uint64_t>& bitmap_for(Side side) noexcept {
+        return side == Side::Buy ? bid_bitmap_ : ask_bitmap_;
+    }
+
+    // Read-only version for functions that only inspect the bitmap.
+    const std::vector<std::uint64_t>& bitmap_for(
+        Side side
+    ) const noexcept {
+        return side == Side::Buy ? bid_bitmap_ : ask_bitmap_;
+    }
+
+    // Set or clear the occupancy bit for a price level.
+    //
+    // Each uint64_t stores 64 bits. Division selects the word, and
+    // remainder selects the bit within that word.
+    void set_level_bit(
+        Side side,
+        std::size_t level_index,
+        bool occupied
+    ) noexcept {
+        auto& bitmap = bitmap_for(side);
+
+        const std::size_t word_index = level_index / 64U;
+        const unsigned bit_offset =
+            static_cast<unsigned>(level_index % 64U);
+
+        // Create a mask with exactly the selected bit set.
+        const std::uint64_t mask =
+            std::uint64_t{1} << bit_offset;
+
+        if (occupied) {
+            // OR sets the selected bit to 1 without changing other bits.
+            bitmap[word_index] |= mask;
+        } else {
+            // AND with the inverted mask clears only the selected bit.
+            bitmap[word_index] &= ~mask;
+        }
+    }
+
+    // Check whether a particular price level is marked as occupied.
+    [[nodiscard]]
+    bool level_bit_is_set(
+        Side side,
+        std::size_t level_index
+    ) const noexcept {
+        const auto& bitmap = bitmap_for(side);
+
+        const std::size_t word_index = level_index / 64U;
+        const unsigned bit_offset =
+            static_cast<unsigned>(level_index % 64U);
+
+        const std::uint64_t mask =
+            std::uint64_t{1} << bit_offset;
+
+        // The result is nonzero when the corresponding bit is set.
+        return (bitmap[word_index] & mask) != 0U;
     }
 
     // Return the current best eligible opposing price, if one exists.
@@ -593,97 +701,146 @@ private:
     //
     // This version scans array slots. Later we will replace this search with
     // a bitmap, so we can measure the bitmap improvement separately.
+
+    // Find the next occupied price strictly beyond current_price.
+    //
+    // Unlike V2.1, this scans bitmap words, not individual price slots.
+    // std::countr_zero finds the lowest set bit (the nearest higher ask).
+    // std::countl_zero helps find the highest set bit (the nearest lower bid).
     [[nodiscard]]
     std::optional<Price> next_non_empty_price(
         Side side,
         Price current_price
     ) const {
-        const std::vector<Level>& levels = levels_for(side);
         const std::size_t current_index = index_for(current_price);
+        const std::size_t level_count = bids_.size();
+
+        const auto& bitmap = bitmap_for(side);
+
+        constexpr std::uint64_t all_bits =
+            std::numeric_limits<std::uint64_t>::max();
 
         if (side == Side::Sell) {
-            // Asks: search toward higher prices.
-            for (std::size_t index = current_index + 1U;
-                 index < levels.size();
-                 ++index) {
-                if (levels[index].active
-                    && !levels[index].orders.empty()) {
-                    return price_for_index(index);
+            // Asks: find the nearest occupied index strictly above this one.
+            const std::size_t start_index = current_index + 1U;
+
+            // The current price was the last configured level.
+            if (start_index >= level_count) {
+                return std::nullopt;
+            }
+
+            std::size_t word_index = start_index / 64U;
+
+            const unsigned first_bit =
+                static_cast<unsigned>(start_index % 64U);
+
+            // Clear bits below start_index in the first word. We don't want
+            // to accidentally select the current level or a lower ask.
+            std::uint64_t word =
+                bitmap[word_index] & (all_bits << first_bit);
+
+            while (true) {
+                if (word != 0U) {
+                    // The lowest set bit is the nearest higher occupied level.
+                    const std::size_t found_index =
+                        word_index * 64U
+                        + static_cast<std::size_t>(
+                            std::countr_zero(word)
+                        );
+
+                    // The final word might contain padding bits. Those bits
+                    // are never set, but retain the boundary check defensively.
+                    if (found_index < level_count) {
+                        return price_for_index(found_index);
+                    }
+                }
+
+                // No suitable bit in this word. Continue to the next word.
+                ++word_index;
+
+                if (word_index >= bitmap.size()) {
+                    break;
+                }
+
+                word = bitmap[word_index];
+            }
+
+            return std::nullopt;
+        }
+
+        // Bids: find the nearest occupied index strictly below this one.
+        if (current_index == 0U) {
+            return std::nullopt;
+        }
+
+        const std::size_t start_index = current_index - 1U;
+        std::size_t word_index = start_index / 64U;
+
+        const unsigned last_bit =
+            static_cast<unsigned>(start_index % 64U);
+
+        // Retain only bits at or below start_index in the first word.
+        const std::uint64_t mask = last_bit == 63U
+            ? all_bits
+            : ((std::uint64_t{1} << (last_bit + 1U)) - 1U);
+
+        std::uint64_t word = bitmap[word_index] & mask;
+
+        while (true) {
+            if (word != 0U) {
+                // The highest set bit is the nearest lower occupied bid.
+                const unsigned highest_bit =
+                    63U - static_cast<unsigned>(
+                        std::countl_zero(word)
+                    );
+
+                const std::size_t found_index =
+                    word_index * 64U + highest_bit;
+
+                if (found_index < level_count) {
+                    return price_for_index(found_index);
                 }
             }
-        } else {
-            // Bids: search toward lower prices. The guard avoids unsigned
-            // underflow when current_index reaches zero.
-            std::size_t index = current_index;
 
-            while (index > 0U) {
-                --index;
-
-                if (levels[index].active
-                    && !levels[index].orders.empty()) {
-                    return price_for_index(index);
-                }
+            // No suitable bit in this word. Search the preceding word.
+            if (word_index == 0U) {
+                break;
             }
+
+            --word_index;
+            word = bitmap[word_index];
         }
 
         return std::nullopt;
     }
 
+
     // Refresh the cached best price after its former best level becomes empty.
     //
     // The price range is bounded. We scan outward from the emptied level
     // until another occupied level is found. If none exists, the side is empty.
+        // Only refresh the cached price if the level that emptied was the best.
+    // The bitmap now finds the next occupied level without scanning every tick.
     void refresh_best_after_empty(
         Side side,
         Price emptied_price
     ) {
         if (side == Side::Buy) {
-            // Removing a non-best bid does not affect the best bid cache.
             if (!best_bid_.has_value()
                 || *best_bid_ != emptied_price) {
                 return;
             }
 
-            best_bid_.reset();
-
-            const std::size_t emptied_index = index_for(emptied_price);
-
-            // Lower bids have lower array indices.
-            std::size_t index = emptied_index;
-
-            while (index > 0U) {
-                --index;
-
-                if (bids_[index].active
-                    && !bids_[index].orders.empty()) {
-                    best_bid_ = price_for_index(index);
-                    return;
-                }
-            }
-
+            best_bid_ = next_non_empty_price(Side::Buy, emptied_price);
             return;
         }
 
-        // Removing a non-best ask does not affect the best ask cache.
         if (!best_ask_.has_value()
             || *best_ask_ != emptied_price) {
             return;
         }
 
-        best_ask_.reset();
-
-        const std::size_t emptied_index = index_for(emptied_price);
-
-        // Higher asks have higher array indices.
-        for (std::size_t index = emptied_index + 1U;
-             index < asks_.size();
-             ++index) {
-            if (asks_[index].active
-                && !asks_[index].orders.empty()) {
-                best_ask_ = price_for_index(index);
-                return;
-            }
-        }
+        best_ask_ = next_non_empty_price(Side::Sell, emptied_price);
     }
 
     // Remove an existing order from its level and the ID index.
@@ -711,6 +868,8 @@ private:
         if (level.orders.empty()) {
             level.active = false;
             --active_level_count_;
+            // Clear the bit because this price no longer has resting orders.
+            set_level_bit(handle.side, index_for(handle.price), false);
 
             // If the emptied level was the best price, find its replacement.
             refresh_best_after_empty(handle.side, handle.price);
@@ -755,6 +914,9 @@ private:
         if (level_was_empty) {
             level.active = true;
             ++active_level_count_;
+
+            // Mark this price as occupied in the side's bitmap.
+            set_level_bit(side, index_for(price), true);
         }
 
         // Maintain the cached best price when adding a new level.
@@ -834,6 +996,10 @@ private:
                     level.active = false;
                     --active_level_count_;
 
+                    // The level became empty because the last maker was fully filled.
+                    set_level_bit(maker_side, maker_index, false);
+
+                    // If this was the best price, use the updated bitmap to find the next.
                     refresh_best_after_empty(maker_side, maker.price);
                 }
             }

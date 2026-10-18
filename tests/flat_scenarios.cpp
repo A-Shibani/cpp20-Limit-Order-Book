@@ -191,5 +191,85 @@ TEST(BookFlatScenarios, RejectsOverflowWithoutChangingBook) {
     EXPECT_TRUE(book.check_invariants());
 }
 
+
+TEST(BookFlatScenarios, FindsNextAskAcrossBitmapWordBoundary) {
+    BookFlat book;
+    Events events;
+
+    const auto collect = [&events](const Event& event) {
+        events.push_back(event);
+    };
+
+    // With the default range, price 101 and price 300 fall in different
+    // bitmap words. Emptying 101 must find 300 without scanning every tick.
+    book.submit(
+        OrderRequest::limit_order(1, Side::Sell, 2, 101),
+        collect
+    );
+    book.submit(
+        OrderRequest::limit_order(2, Side::Sell, 3, 300),
+        collect
+    );
+
+    events.clear();
+    book.submit(
+        OrderRequest::market_order(10, Side::Buy, 2),
+        collect
+    );
+
+    ASSERT_EQ(events.size(), 2U);
+    EXPECT_EQ(events[1], (Event{TradeEvent{1, 10, 101, 2}}));
+
+    // The next market buy must locate the ask at 300.
+    events.clear();
+    book.submit(
+        OrderRequest::market_order(11, Side::Buy, 1),
+        collect
+    );
+
+    ASSERT_EQ(events.size(), 2U);
+    EXPECT_EQ(events[1], (Event{TradeEvent{2, 11, 300, 1}}));
+
+    EXPECT_TRUE(book.check_invariants());
+}
+
+TEST(BookFlatScenarios, FindsNextBidAcrossBitmapWordBoundary) {
+    BookFlat book;
+    Events events;
+
+    const auto collect = [&events](const Event& event) {
+        events.push_back(event);
+    };
+
+    // Price 300 and price 101 occupy different bitmap words.
+    book.submit(
+        OrderRequest::limit_order(1, Side::Buy, 2, 300),
+        collect
+    );
+    book.submit(
+        OrderRequest::limit_order(2, Side::Buy, 3, 101),
+        collect
+    );
+
+    events.clear();
+    book.cancel(1, collect);
+
+    ASSERT_EQ(events.size(), 1U);
+    EXPECT_EQ(events[0], (Event{CancelAckEvent{1}}));
+
+    // Once bid 300 disappears, the bitmap must find bid 101.
+    events.clear();
+    book.submit(
+        OrderRequest::market_order(10, Side::Sell, 1),
+        collect
+    );
+
+    ASSERT_EQ(events.size(), 2U);
+    EXPECT_EQ(events[1], (Event{TradeEvent{2, 10, 101, 1}}));
+
+    EXPECT_TRUE(book.check_invariants());
+}
+
+
 }  // namespace
 }  // namespace lob

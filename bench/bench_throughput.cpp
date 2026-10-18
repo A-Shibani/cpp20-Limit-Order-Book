@@ -141,20 +141,20 @@ static void BM_V1_CancelHeavy(benchmark::State& state) {
 }
 
 
-static void BM_V2_1_Balanced(benchmark::State& state) {
+static void BM_V2_2_Balanced(benchmark::State& state) {
     // Use the same seed and workload kind as V0 and V1.
     run_throughput_benchmark<lob::BookFlat>(
         state, lob::bench::WorkloadKind::Balanced, 1001
     );
 }
 
-static void BM_V2_1_CrossingHeavy(benchmark::State& state) {
+static void BM_V2_2_CrossingHeavy(benchmark::State& state) {
     run_throughput_benchmark<lob::BookFlat>(
         state, lob::bench::WorkloadKind::CrossingHeavy, 1002
     );
 }
 
-static void BM_V2_1_CancelHeavy(benchmark::State& state) {
+static void BM_V2_2_CancelHeavy(benchmark::State& state) {
     run_throughput_benchmark<lob::BookFlat>(
         state, lob::bench::WorkloadKind::CancelHeavy, 1003
     );
@@ -170,9 +170,9 @@ BENCHMARK(BM_V1_Balanced)->Arg(2000)->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_V1_CrossingHeavy)->Arg(2000)->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_V1_CancelHeavy)->Arg(2000)->Unit(benchmark::kMillisecond);
 
-BENCHMARK(BM_V2_1_Balanced)->Arg(2000)->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_V2_1_CrossingHeavy)->Arg(2000)->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_V2_1_CancelHeavy)->Arg(2000)->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_V2_2_Balanced)->Arg(2000)->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_V2_2_CrossingHeavy)->Arg(2000)->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_V2_2_CancelHeavy)->Arg(2000)->Unit(benchmark::kMillisecond);
 
 }  // namespace
 
