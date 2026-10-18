@@ -4,6 +4,9 @@ cmake_minimum_required(VERSION 3.20)
 project(lob_engine VERSION 0.1.0 LANGUAGES CXX)
 
 option(LOB_BUILD_TESTS "Build the limit order book tests" ON)
+# Keep benchmarking optional so ordinary test builds do not need
+# to download or compile Google Benchmark.
+option(LOB_BUILD_BENCHMARKS "Build throughput benchmarks" OFF)
 option(LOB_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 
 add_library(lob INTERFACE)
@@ -49,6 +52,7 @@ if(LOB_BUILD_TESTS)
 
     FetchContent_MakeAvailable(googletest)
 
+
     add_executable(
         lob_tests
         tests/types_tests.cpp
@@ -56,6 +60,7 @@ if(LOB_BUILD_TESTS)
         tests/invariants.cpp
         tests/map_scenarios.cpp
         tests/differential.cpp
+        tests/flat_scenarios.cpp
     )
     target_link_libraries(lob_tests PRIVATE lob GTest::gtest_main)
     set_target_properties(lob_tests PROPERTIES CXX_EXTENSIONS OFF)
@@ -63,3 +68,43 @@ if(LOB_BUILD_TESTS)
     include(GoogleTest)
     gtest_discover_tests(lob_tests)
 endif()
+
+
+if(LOB_BUILD_BENCHMARKS)
+    include(FetchContent)
+
+    # We need the benchmark library, not its own test suite.
+    set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL
+        "Disable Google Benchmark's tests" FORCE)
+    set(BENCHMARK_ENABLE_GTEST_TESTS OFF CACHE BOOL
+        "Disable Google Benchmark's GoogleTest tests" FORCE)
+    set(BENCHMARK_ENABLE_INSTALL OFF CACHE BOOL
+        "Disable Google Benchmark installation targets" FORCE)
+
+    FetchContent_Declare(
+        googlebenchmark
+        GIT_REPOSITORY https://github.com/google/benchmark.git
+        GIT_TAG v1.9.1
+        GIT_SHALLOW TRUE
+    )
+
+    FetchContent_MakeAvailable(googlebenchmark)
+
+    # Compile the benchmark harness and link it to our engine headers
+    # and Google Benchmark.
+    add_executable(
+        lob_bench
+        bench/bench_throughput.cpp
+    )
+
+    target_link_libraries(
+        lob_bench
+        PRIVATE lob benchmark::benchmark
+    )
+
+    set_target_properties(
+        lob_bench
+        PROPERTIES CXX_EXTENSIONS OFF
+    )
+endif()
+

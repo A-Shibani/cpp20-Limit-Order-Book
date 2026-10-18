@@ -12,12 +12,12 @@ No performance claims should be made until measurements are collected.
 
 Record these details for every published result:
 
-- CPU:
-- CPU core count:
-- RAM:
-- OS version:
-- Compiler and version:
-- CMake version:
+- CPU: Intel Core i7-10510U, 4 cores / 8 logical processors
+- OS: Windows 10 Enterprise, build 26200 (as reported)
+- Compiler: MSVC 19.51.36260, x86 target
+- CMake: 4.4.4
+- Build type: Release
+- Architecture: x86 (32-bit)
 - Build type: Release
 - Compiler flags:
 - Benchmark command:
@@ -73,7 +73,46 @@ This section will be expanded after we establish the V1 baseline.
 |---|---|---|---:|---|
 | V0 | Vector-based reference model | Pending | Pending | Baseline |
 | V1 | Ordered price maps, FIFO lists, ID index | Pending | Pending | To be measured |
-| V2.1 | Flat array of price levels | Pending | Pending | Not implemented |
+
+## V2.1 — Flat price-level array (18 October 2026)
+
+### Environment
+
+- CPU: Intel Core i7-10510U, 4 cores / 8 logical processors
+- OS: Windows 10 Enterprise, reported build 26200
+- Compiler: MSVC 19.51.36260, x86 target
+- CMake: 4.4.4
+- Build type: Release
+- Repetitions: 5
+- Operations per batch: 2,000
+
+### Median throughput
+
+| Workload | V0 (ops/s) | V1 (ops/s) | V2.1 (ops/s) | V2.1 / V1 |
+|---|---:|---:|---:|---:|
+| Balanced | 1.348M | 4.588M | 6.368M | 1.39x |
+| Crossing-heavy | 4.245M | 4.495M | 0.250M | 0.056x |
+| Cancel-heavy | 2.607M | 5.213M | 8.000M | 1.53x |
+
+### Interpretation
+
+The flat array improves throughput on the balanced and cancel-heavy
+synthetic workloads but produces a severe regression on the crossing-heavy
+workload.
+
+Initial code inspection identifies linear scanning of empty price-array
+slots as a likely cause. The next implementation will use a bitmap to locate
+occupied levels without checking every intervening tick.
+
+This diagnosis has not yet been confirmed with a profiler.
+
+The results are preliminary. The crossing-heavy regression is clear, but
+some V2.1 repetitions show substantial variability, so the benchmark should
+be rerun after the bitmap change with a longer measurement duration.
+
+Do not use these numbers as universal engine-performance claims. They describe
+this implementation and the recorded x86 Release environment.
+
 | V2.2 | Preallocated order pool and intrusive lists | Pending | Pending | Not implemented |
 | V2.3 | Bitmap for non-empty levels | Pending | Pending | Not implemented |
 | V2.4 | Flat open-addressing ID map | Pending | Pending | Not implemented |

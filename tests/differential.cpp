@@ -1,6 +1,7 @@
 
 #include "lob/book_map.hpp"
 #include "lob/book_ref.hpp"
+#include "lob/book_flat.hpp"
 
 #include <cstdint>
 #include <random>
@@ -97,9 +98,12 @@ TEST(DifferentialTests, BookMapMatchesReferenceOverSeededStreams) {
 
         BookRef reference;
         BookMap candidate;
+        BookFlat flat_candidate;
 
         std::vector<Event> reference_events;
         std::vector<Event> candidate_events;
+        std::vector<Event> flat_events;
+        flat_events.reserve(64);
 
         // Reserve event storage before the operation loop, avoiding
         // repeated reallocations while collecting a single operation.
@@ -149,14 +153,28 @@ TEST(DifferentialTests, BookMapMatchesReferenceOverSeededStreams) {
 
             reference_events.clear();
             candidate_events.clear();
+            flat_events.clear();
 
             apply_operation(reference, operation, reference_events);
             apply_operation(candidate, operation, candidate_events);
+            // Apply the identical input to V2.1. All engines receive the same
+            // operation, so any difference in events or state is significant.
+            apply_operation(flat_candidate, operation, flat_events);
 
             // Events must match exactly, including order and contents.
             if (reference_events != candidate_events) {
                 FAIL()
                     << "Event mismatch: seed=" << seed
+                    << ", step=" << step
+                    << ", id=" << id
+                    << ", price=" << price
+                    << ", quantity=" << quantity;
+            }
+
+            // V2.1 must emit the same ordered events as the reference engine.
+            if (reference_events != flat_events) {
+                FAIL()
+                    << "V0/V2.1 event mismatch: seed=" << seed
                     << ", step=" << step
                     << ", id=" << id
                     << ", price=" << price
@@ -173,6 +191,17 @@ TEST(DifferentialTests, BookMapMatchesReferenceOverSeededStreams) {
                     << ", quantity=" << quantity;
             }
 
+            // Snapshot comparison catches differences in resting quantities,
+            // order priority, side, price, IDs and sequence numbers.
+            if (reference.snapshot() != flat_candidate.snapshot()) {
+                FAIL()
+                    << "V0/V2.1 snapshot mismatch: seed=" << seed
+                    << ", step=" << step
+                    << ", id=" << id
+                    << ", price=" << price
+                    << ", quantity=" << quantity;
+            }
+
             // Check internal invariants in each implementation too.
             if (!reference.check_invariants()) {
                 FAIL()
@@ -183,6 +212,12 @@ TEST(DifferentialTests, BookMapMatchesReferenceOverSeededStreams) {
             if (!candidate.check_invariants()) {
                 FAIL()
                     << "V1 invariant failure: seed=" << seed
+                    << ", step=" << step;
+            }
+
+            if (!flat_candidate.check_invariants()) {
+                FAIL()
+                    << "V2.1 invariant failure: seed=" << seed
                     << ", step=" << step;
             }
         }
