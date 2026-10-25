@@ -19,6 +19,7 @@ enum class RejectReason : std::uint8_t {
     ZeroQuantity,
     PriceOutOfRange,
     QuantityOverflow,
+    OrderPoolExhausted
 };
 
 struct AckEvent {

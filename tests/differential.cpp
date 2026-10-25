@@ -2,6 +2,7 @@
 #include "lob/book_map.hpp"
 #include "lob/book_ref.hpp"
 #include "lob/book_flat.hpp"
+#include "lob/book_pool.hpp"
 
 #include <cstdint>
 #include <random>
@@ -100,9 +101,15 @@ TEST(DifferentialTests, BookMapMatchesReferenceOverSeededStreams) {
         BookMap candidate;
         BookFlat flat_candidate;
 
+        // The random generator uses IDs 1–48, so a capacity of 64 is sufficient.
+        // This keeps the test focused on engine behaviour rather than pool exhaustion.
+        BookPool pool_candidate(64);
+
         std::vector<Event> reference_events;
         std::vector<Event> candidate_events;
         std::vector<Event> flat_events;
+        std::vector<Event> pool_events;
+        pool_events.reserve(64);
         flat_events.reserve(64);
 
         // Reserve event storage before the operation loop, avoiding
@@ -154,12 +161,16 @@ TEST(DifferentialTests, BookMapMatchesReferenceOverSeededStreams) {
             reference_events.clear();
             candidate_events.clear();
             flat_events.clear();
+            pool_events.clear();
 
             apply_operation(reference, operation, reference_events);
             apply_operation(candidate, operation, candidate_events);
             // Apply the identical input to V2.1. All engines receive the same
             // operation, so any difference in events or state is significant.
             apply_operation(flat_candidate, operation, flat_events);
+            // Send the exact same operation to V2.3.
+            // The pool implementation must produce identical observable behaviour.
+            apply_operation(pool_candidate, operation, pool_events);
 
             // Events must match exactly, including order and contents.
             if (reference_events != candidate_events) {
@@ -200,6 +211,33 @@ TEST(DifferentialTests, BookMapMatchesReferenceOverSeededStreams) {
                     << ", id=" << id
                     << ", price=" << price
                     << ", quantity=" << quantity;
+            }
+
+            // All implementations must emit the same events in the same order.
+            if (reference_events != pool_events) {
+                FAIL()
+                    << "V0/V2.3 event mismatch: seed=" << seed
+                    << ", step=" << step
+                    << ", id=" << id
+                    << ", price=" << price
+                    << ", quantity=" << quantity;
+            }
+
+            // Compare logical resting orders, not internal pool slot indices.
+            if (reference.snapshot() != pool_candidate.snapshot()) {
+                FAIL()
+                    << "V0/V2.3 snapshot mismatch: seed=" << seed
+                    << ", step=" << step
+                    << ", id=" << id
+                    << ", price=" << price
+                    << ", quantity=" << quantity;
+            }
+
+            // The pool's own links, ID index, bitmap and quantity totals must agree.
+            if (!pool_candidate.check_invariants()) {
+                FAIL()
+                    << "V2.3 invariant failure: seed=" << seed
+                    << ", step=" << step;
             }
 
             // Check internal invariants in each implementation too.

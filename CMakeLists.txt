@@ -61,6 +61,8 @@ if(LOB_BUILD_TESTS)
         tests/map_scenarios.cpp
         tests/differential.cpp
         tests/flat_scenarios.cpp
+        tests/pool_tests.cpp
+        tests/pool_engine_tests.cpp
     )
     target_link_libraries(lob_tests PRIVATE lob GTest::gtest_main)
     set_target_properties(lob_tests PROPERTIES CXX_EXTENSIONS OFF)

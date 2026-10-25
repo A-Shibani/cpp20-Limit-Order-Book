@@ -5,11 +5,26 @@
 #include "lob/book_flat.hpp"
 
 #include <benchmark/benchmark.h>
-
+#include "lob/book_pool.hpp"
+#include <type_traits>
 #include <cstddef>
 #include <cstdint>
 
 namespace {
+    
+    template <typename Book>
+    Book make_benchmark_book() {
+        // V2.3 needs a fixed order capacity. At most 128 initial orders plus
+        // 2,000 generated operations can introduce resting orders in one batch.
+        // A capacity of 4,096 leaves ample room for this workload.
+        if constexpr (std::is_same_v<Book, lob::BookPool>) {
+            return Book(4096);
+        } else {
+            // V0, V1 and V2.2 use their default constructors.
+            return Book{};
+        }
+    }
+
 
 // Replay exactly the same pre-generated workload through whichever engine
 // type is supplied as the template argument.
@@ -41,7 +56,7 @@ void run_throughput_benchmark(
         state.PauseTiming();
 
         {
-            Book book;
+            Book book = make_benchmark_book<Book>();
             std::uint64_t event_count = 0;
 
             // Count emitted events without allocating or storing them.
@@ -160,6 +175,25 @@ static void BM_V2_2_CancelHeavy(benchmark::State& state) {
     );
 }
 
+
+static void BM_V2_3_Balanced(benchmark::State& state) {
+    run_throughput_benchmark<lob::BookPool>(
+        state, lob::bench::WorkloadKind::Balanced, 1001
+    );
+}
+
+static void BM_V2_3_CrossingHeavy(benchmark::State& state) {
+    run_throughput_benchmark<lob::BookPool>(
+        state, lob::bench::WorkloadKind::CrossingHeavy, 1002
+    );
+}
+
+static void BM_V2_3_CancelHeavy(benchmark::State& state) {
+    run_throughput_benchmark<lob::BookPool>(
+        state, lob::bench::WorkloadKind::CancelHeavy, 1003
+    );
+}
+
 // Each batch replays 2,000 operations. We will start small, then increase
 // the workload size once the initial benchmark is working correctly.
 BENCHMARK(BM_V0_Balanced)->Arg(2000)->Unit(benchmark::kMillisecond);
@@ -173,6 +207,10 @@ BENCHMARK(BM_V1_CancelHeavy)->Arg(2000)->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_V2_2_Balanced)->Arg(2000)->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_V2_2_CrossingHeavy)->Arg(2000)->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_V2_2_CancelHeavy)->Arg(2000)->Unit(benchmark::kMillisecond);
+
+BENCHMARK(BM_V2_3_Balanced)->Arg(2000)->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_V2_3_CrossingHeavy)->Arg(2000)->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_V2_3_CancelHeavy)->Arg(2000)->Unit(benchmark::kMillisecond);
 
 }  // namespace
 

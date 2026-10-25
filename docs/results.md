@@ -147,6 +147,42 @@ The bitmap lets the engine skip groups of empty price slots when locating
 the next occupied level. The experiment changes price-level search while
 retaining list-based order storage and the unordered ID index.
 
-| V2.3 | Bitmap for non-empty levels | Pending | Pending | Not implemented |
+
+## V2.3 — Preallocated order pool and intrusive FIFO
+
+### Method
+
+- CPU: Intel Core i7-10510U, 4 cores / 8 logical processors
+- OS: Windows 10 Enterprise, reported build 26200
+- Compiler: MSVC 19.51.36260, x86 target
+- Build type: Release
+- Operations per batch: 2,000
+- Repetitions: 3
+- Engine: flat price array + occupancy bitmap + order pool
+- Pool capacity in benchmark: 4,096 slots
+
+### Results
+
+| Workload | V2.2 median (ops/s) | V2.3 median (ops/s) | Relative change |
+|---|---:|---:|---:|
+| Balanced | 7.646M | 10.596M | +38.6% |
+| Crossing-heavy | 5.158M | 7.654M | +48.4% |
+| Cancel-heavy | 8.862M | 7.369M | -16.8% |
+
+### Interpretation
+
+Replacing std::list order nodes with preallocated pool slots and intrusive
+FIFO links improved the balanced and crossing-heavy results in this run,
+but reduced throughput in the cancel-heavy workload.
+
+The coefficients of variation were high, so these results are preliminary.
+Repeat measurements before using the results in a CV or making definitive
+performance claims.
+
+The pool avoids separate list-node allocations during replay, but the
+unordered ID index can still allocate entries. The experiment therefore
+measures the pool and intrusive-list change, not a completely allocation-free
+engine.
+
 | V2.4 | Flat open-addressing ID map | Pending | Pending | Not implemented |
 | V2.5 | Generation counters on handles | Pending | Pending | Not implemented |
