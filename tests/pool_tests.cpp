@@ -125,5 +125,141 @@ TEST(OrderPoolTests, ZeroCapacityPoolFailsGracefully) {
     EXPECT_EQ(pool.acquire(), OrderPool::no_slot);
 }
 
+// -----------------------------------------------------------------------------
+// V2.5: Generation-aware handle tests
+// -----------------------------------------------------------------------------
+//
+// A pool slot can be reused many times. A generation-aware handle identifies
+// one particular use of that slot, not just the slot's numerical index.
+//
+// These tests verify that a handle from an old order cannot accidentally be
+// treated as a handle to a newer order that reuses the same slot.
+
+TEST(OrderPoolGenerationTests, AcquireHandleReturnsValidGeneration) {
+    // A capacity of one makes it easy to observe exactly which slot is reused.
+    lob::OrderPool pool(1);
+
+    const lob::OrderPool::Handle handle = pool.acquire_handle();
+
+    // A successful handle has a real slot index and nonzero generation.
+    ASSERT_NE(handle.index, lob::OrderPool::no_slot);
+    EXPECT_NE(handle.generation, 0U);
+
+    EXPECT_TRUE(pool.is_valid(handle));
+    EXPECT_TRUE(pool.is_active(handle.index));
+    EXPECT_EQ(pool.generation(handle.index), handle.generation);
+
+    EXPECT_EQ(pool.available(), 0U);
+    EXPECT_EQ(pool.in_use(), 1U);
+}
+
+TEST(OrderPoolGenerationTests, ReleaseHandleInvalidatesIt) {
+    lob::OrderPool pool(1);
+
+    const auto handle = pool.acquire_handle();
+    ASSERT_TRUE(pool.is_valid(handle));
+
+    // Releasing the handle returns its slot to the free list.
+    EXPECT_TRUE(pool.release(handle));
+
+    // A handle must become invalid as soon as its order is released.
+    EXPECT_FALSE(pool.is_valid(handle));
+    EXPECT_FALSE(pool.is_active(handle.index));
+
+    EXPECT_EQ(pool.available(), 1U);
+    EXPECT_EQ(pool.in_use(), 0U);
+
+    // Releasing the same handle a second time must fail.
+    EXPECT_FALSE(pool.release(handle));
+}
+
+TEST(OrderPoolGenerationTests, ReuseIncrementsGeneration) {
+    lob::OrderPool pool(1);
+
+    const auto first_handle = pool.acquire_handle();
+    ASSERT_TRUE(pool.is_valid(first_handle));
+
+    ASSERT_TRUE(pool.release(first_handle));
+
+    // The capacity-one pool must reuse the same numerical slot.
+    const auto second_handle = pool.acquire_handle();
+
+    ASSERT_NE(second_handle.index, lob::OrderPool::no_slot);
+    EXPECT_EQ(second_handle.index, first_handle.index);
+
+    // The slot is the same, but this is a different lifetime.
+    EXPECT_GT(second_handle.generation, first_handle.generation);
+
+    EXPECT_FALSE(pool.is_valid(first_handle));
+    EXPECT_TRUE(pool.is_valid(second_handle));
+}
+
+TEST(OrderPoolGenerationTests, StaleHandleCannotReleaseReusedSlot) {
+    lob::OrderPool pool(1);
+
+    const auto old_handle = pool.acquire_handle();
+    ASSERT_TRUE(pool.release(old_handle));
+
+    const auto current_handle = pool.acquire_handle();
+    ASSERT_TRUE(pool.is_valid(current_handle));
+
+    ASSERT_EQ(current_handle.index, old_handle.index);
+
+    // The old handle refers to the previous lifetime of this slot.
+    // It must not release the current order.
+    EXPECT_FALSE(pool.release(old_handle));
+
+    EXPECT_TRUE(pool.is_valid(current_handle));
+    EXPECT_TRUE(pool.is_active(current_handle.index));
+    EXPECT_EQ(pool.in_use(), 1U);
+    EXPECT_EQ(pool.available(), 0U);
+
+    // The current handle is still allowed to release its own slot.
+    EXPECT_TRUE(pool.release(current_handle));
+    EXPECT_EQ(pool.in_use(), 0U);
+    EXPECT_EQ(pool.available(), 1U);
+}
+
+TEST(OrderPoolGenerationTests, HandleForSupportsIndexBasedAcquisition) {
+    lob::OrderPool pool(2);
+
+    // Existing BookPool code acquires slots by index. handle_for() allows
+    // that code to construct a generation-aware handle without changing
+    // the allocation API all at once.
+    const lob::OrderPool::Index index = pool.acquire();
+
+    ASSERT_NE(index, lob::OrderPool::no_slot);
+
+    const auto handle = pool.handle_for(index);
+
+    EXPECT_EQ(handle.index, index);
+    EXPECT_NE(handle.generation, 0U);
+    EXPECT_TRUE(pool.is_valid(handle));
+
+    // Releasing through the legacy index-based interface must also invalidate
+    // the generation-aware handle.
+    EXPECT_TRUE(pool.release(index));
+    EXPECT_FALSE(pool.is_valid(handle));
+}
+
+TEST(OrderPoolGenerationTests, ExhaustedPoolReturnsInvalidHandle) {
+    lob::OrderPool pool(1);
+
+    const auto first_handle = pool.acquire_handle();
+    ASSERT_TRUE(pool.is_valid(first_handle));
+
+    // There are no free slots, so another acquisition must fail safely.
+    const auto failed_handle = pool.acquire_handle();
+
+    EXPECT_EQ(failed_handle.index, lob::OrderPool::no_slot);
+    EXPECT_EQ(failed_handle.generation, 0U);
+    EXPECT_FALSE(pool.is_valid(failed_handle));
+
+    // Failed allocation must not disturb the live order.
+    EXPECT_TRUE(pool.is_valid(first_handle));
+    EXPECT_EQ(pool.in_use(), 1U);
+    EXPECT_EQ(pool.available(), 0U);
+}
+
 }  // namespace
 }  // namespace lob

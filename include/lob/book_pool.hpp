@@ -50,6 +50,10 @@ private:
         Side side{Side::Buy};
         Price price{};
         Index slot{no_slot};
+
+        // Identifies this particular lifetime of the pool slot.
+        // The slot index can be reused, but its generation changes.
+        OrderPool::Generation generation{0};
     };
 
     using OrderIndex = OrderIdMap<OrderHandle>;
@@ -192,6 +196,7 @@ public:
             return;
         }
 
+        require_current_handle(*handle);
         // Copy the original before any operation releases its slot.
         const OrderPool::OrderSlot original =
             pool_[handle->slot];
@@ -284,6 +289,8 @@ public:
             [&](OrderId id, const OrderHandle& handle) {
                 (void)id;
 
+                require_current_handle(handle);
+
                 const auto& order = pool_[handle.slot];
 
                 result.push_back(RestingOrderSnapshot{
@@ -354,8 +361,7 @@ public:
 
                 // Start from each live ID entry and check that it leads to a
                 // valid active pool slot and a valid occupied level.
-                if (handle.slot >= pool_.capacity()
-                    || !pool_.is_active(handle.slot)
+                if (!is_current_handle(handle)
                     || !range_.contains(handle.price)) {
                     entries_are_valid = false;
                     return;
@@ -451,7 +457,9 @@ public:
                     const OrderHandle* reverse = order_index_.find(current.id);
 
                     if (reverse == nullptr
+                        || !is_current_handle(*reverse)
                         || reverse->slot != cursor
+                        || reverse->generation != current.generation
                         || reverse->side != current.side
                         || reverse->price != current.price) {
                         entries_are_valid = false;
@@ -488,8 +496,9 @@ public:
         if (counted_orders != order_index_.size()
             || counted_orders != resting_order_count_
             || pool_.in_use() != resting_order_count_
-            || pool_.available() + pool_.in_use() != pool_.capacity()) {
-            return false;
+            || pool_.available() + pool_.in_use() + pool_.retired()
+                != pool_.capacity()) {
+                return false;
         }
 
         if (visited_levels.size() != active_level_count_) {
@@ -568,6 +577,30 @@ private:
 
     std::optional<Price> best_bid_;
     std::optional<Price> best_ask_;
+
+    // Convert the book's ID handle into the handle format used by OrderPool.
+    [[nodiscard]]
+    static OrderPool::Handle to_pool_handle(
+        const OrderHandle& handle
+    ) noexcept {
+        return OrderPool::Handle{handle.slot, handle.generation};
+    }
+
+    // Check that the handle still refers to the current lifetime of its slot.
+    [[nodiscard]]
+    bool is_current_handle(const OrderHandle& handle) const noexcept {
+        return pool_.is_valid(to_pool_handle(handle));
+    }
+
+    // Treat a stale handle as an internal logic error.
+    // It must never be used to access another order that reused the same slot.
+    void require_current_handle(const OrderHandle& handle) const {
+        if (!is_current_handle(handle)) {
+            throw std::logic_error(
+                "Stale order handle found in BookPool ID map"
+            );
+        }
+    }
 
     [[nodiscard]]
     std::size_t index_for(Price price) const noexcept {
@@ -800,6 +833,8 @@ private:
         }
 
         const OrderHandle handle = *found;
+        require_current_handle(handle);
+
         const Index slot_index = handle.slot;
 
         auto& levels = levels_for(handle.side);
@@ -842,7 +877,7 @@ private:
         // The slot is now detached from the level and can be reused.
         // Treat failure as a logic error rather than silently corrupting
         // the free list and live-order count.
-        if (!pool_.release(slot_index)) {
+        if (!pool_.release(to_pool_handle(handle))) {
             throw std::logic_error("Failed to release a live order slot");
         }
     }
@@ -871,6 +906,23 @@ private:
 
         const bool was_empty = !level.active;
 
+        // Capture the generation assigned when the slot was acquired.
+        // This generation stays with the order while it rests in the book.
+        const OrderPool::Handle pool_handle = pool_.handle_for(slot_index);
+
+        if (!pool_.is_valid(pool_handle)) {
+            // Roll back the allocation before reporting the internal error.
+            if (!pool_.release(slot_index)) {
+                throw std::logic_error(
+                    "Failed to release an invalid acquired order slot"
+                );
+            }
+
+            throw std::logic_error(
+                "Acquired order slot did not produce a valid handle"
+            );
+        }
+
         // Initialise the acquired slot's order data and queue links.
         auto& slot = pool_[slot_index];
         slot.id = id;
@@ -885,8 +937,11 @@ private:
         // rejects insertion, return the slot so no partially linked order is
         // left behind. Under normal operation this succeeds because the map
         // capacity matches the pool capacity and IDs are checked on submit.
-        if (!order_index_.insert(id, OrderHandle{side, price, slot_index})) {
-            if (!pool_.release(slot_index)) {
+        if (!order_index_.insert(
+                id,
+                OrderHandle{side, price, slot_index, pool_handle.generation}
+            )) {
+            if (!pool_.release(pool_handle)) {
                 throw std::logic_error(
                     "Failed to release a slot after ID-map insertion failure"
                 );
@@ -953,10 +1008,30 @@ private:
 
             // FIFO: the head slot is the oldest resting order at this price.
             const Index maker_index = level.head;
+
+            if (maker_index == no_slot || !pool_.is_active(maker_index)) {
+                throw std::logic_error(
+                    "Best price level has no active maker at its head"
+                );
+            }
+
             auto& maker_slot = pool_[maker_index];
 
-            // Copy the maker details before releasing its slot if filled.
+            // Copy the maker before any operation releases its slot.
             const OrderPool::OrderSlot maker = maker_slot;
+
+            // The queue stores slot indices only. Confirm that the ID map points
+            // to this same slot and this exact generation of the order.
+            const OrderHandle* maker_handle = order_index_.find(maker.id);
+
+            if (maker_handle == nullptr
+                || !is_current_handle(*maker_handle)
+                || maker_handle->slot != maker_index
+                || maker_handle->generation != maker.generation) {
+                throw std::logic_error(
+                    "Maker queue node has no matching generation-aware ID handle"
+                );
+            }
 
             const Quantity executed = std::min(
                 remaining,
@@ -995,7 +1070,9 @@ private:
 
                 // The maker no longer exists in the book, so its pool slot
                 // can be returned to the free list.
-                if (!pool_.release(maker_index)) {
+                if (!pool_.release(
+                        OrderPool::Handle{maker_index, maker.generation}
+                    )) {
                     throw std::logic_error(
                         "Failed to release a filled order slot"
                     );
@@ -1089,6 +1166,7 @@ private:
             if (old_handle != nullptr
                 && old_handle->side == request.side
                 && old_handle->price == destination_price) {
+                require_current_handle(*old_handle);
                 const Quantity old_quantity =
                     pool_[old_handle->slot].remaining_quantity;
 

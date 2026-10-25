@@ -2,6 +2,7 @@
 #include "lob/book_pool.hpp"
 
 #include <limits>
+#include <variant>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -257,6 +258,71 @@ TEST(BookPoolScenarios, CancellingMiddleOrderPreservesIntrusiveQueue) {
     EXPECT_TRUE(book.check_invariants());
 }
 
+// V2.5: After a pool slot is reused, an operation using the old order ID
+// must not affect the new order occupying that slot.
+TEST(BookPoolGenerationTests, ReusedSlotCannotBeCancelledUsingOldOrderId) {
+    // Capacity one guarantees the second resting order reuses the only slot.
+    lob::BookPool book(1);
+
+    std::vector<lob::Event> events;
+
+    // Collect events so we can inspect the response to cancelling the old ID.
+    const auto event_sink = [&events](const lob::Event& event) {
+        events.push_back(event);
+    };
+
+    // First order occupies the only slot.
+    book.submit(
+        lob::OrderRequest::limit_order(1, lob::Side::Buy, 10, 100),
+        event_sink
+    );
+
+    ASSERT_TRUE(book.check_invariants());
+    ASSERT_EQ(book.snapshot().size(), 1U);
+    EXPECT_EQ(book.snapshot()[0].id, 1U);
+
+    // Cancel it, returning its slot to the pool.
+    book.cancel(1, event_sink);
+
+    ASSERT_TRUE(book.check_invariants());
+    ASSERT_TRUE(book.snapshot().empty());
+
+    // A different order now occupies the same pool slot.
+    book.submit(
+        lob::OrderRequest::limit_order(2, lob::Side::Buy, 20, 101),
+        event_sink
+    );
+
+    ASSERT_TRUE(book.check_invariants());
+
+    auto snapshot = book.snapshot();
+    ASSERT_EQ(snapshot.size(), 1U);
+    EXPECT_EQ(snapshot[0].id, 2U);
+    EXPECT_EQ(snapshot[0].remaining_quantity, 20U);
+    EXPECT_EQ(snapshot[0].price, 101U);
+
+    // Ignore the successful events above; inspect only the next operation.
+    events.clear();
+
+    // ID 1 is no longer live. This must be rejected, without cancelling ID 2.
+    book.cancel(1, event_sink);
+
+    ASSERT_EQ(events.size(), 1U);
+
+    const auto* rejection = std::get_if<lob::RejectEvent>(&events[0]);
+    ASSERT_NE(rejection, nullptr);
+    EXPECT_EQ(rejection->order_id, 1U);
+    EXPECT_EQ(rejection->reason, lob::RejectReason::UnknownId);
+
+    // The new order must remain live and unchanged.
+    snapshot = book.snapshot();
+    ASSERT_EQ(snapshot.size(), 1U);
+    EXPECT_EQ(snapshot[0].id, 2U);
+    EXPECT_EQ(snapshot[0].remaining_quantity, 20U);
+    EXPECT_EQ(snapshot[0].price, 101U);
+
+    EXPECT_TRUE(book.check_invariants());
+}
 
 }  // namespace
 }  // namespace lob
