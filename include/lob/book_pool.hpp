@@ -1,10 +1,9 @@
-
 #pragma once
 
 #include "lob/events.hpp"
 #include "lob/pool.hpp"
 #include "lob/types.hpp"
-
+#include "lob/id_map.hpp"
 #include <algorithm>
 #include <bit>
 #include <cstddef>
@@ -12,16 +11,16 @@
 #include <limits>
 #include <optional>
 #include <stdexcept>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 namespace lob {
 
-// V2.3: flat price levels + bitmap + preallocated order pool.
+// V2.4: flat price levels + bitmap + preallocated order pool + fixed ID map.
 //
-// Compared with V2.2, the price arrays and bitmap are retained, but
-// std::list nodes are replaced by pool slots linked through integer indices.
+// Compared with V2.3, resting orders still use pool slots linked through
+// integer indices, but the ID index is now a fixed-capacity open-addressing
+// map instead of std::unordered_map.
 //
 // A live order appears in three places:
 //   1. A slot in OrderPool.
@@ -53,14 +52,14 @@ private:
         Index slot{no_slot};
     };
 
-    using OrderIndex = std::unordered_map<OrderId, OrderHandle>;
+    using OrderIndex = OrderIdMap<OrderHandle>;
 
 public:
     // order_capacity is the maximum number of simultaneously resting orders.
     //
-    // The pool and fixed price arrays are allocated at construction time.
-    // We reserve hash-table buckets here too, reducing rehashing as orders
-    // arrive. The unordered_map can still allocate individual entries.
+    // The pool, fixed price arrays, bitmap, and ID-map buckets are allocated
+    // at construction time. The ID map has the same live-entry capacity as
+    // the order pool, so its storage never needs to grow during matching.
     explicit BookPool(
         std::size_t order_capacity = 65'536,
         PriceRange range = {}
@@ -76,8 +75,8 @@ public:
               checked_bitmap_word_count(range),
               std::uint64_t{0}
           ),
-          pool_(order_capacity) {
-        order_index_.reserve(order_capacity);
+          pool_(order_capacity),
+          order_index_(order_capacity) {
     }
 
     // Submit a limit or market order.
@@ -88,7 +87,7 @@ public:
     ) {
         // Only currently resting orders occupy an ID. Filled or cancelled
         // IDs can be reused, but duplicate live IDs must be rejected.
-        if (order_index_.find(request.id) != order_index_.end()) {
+        if (order_index_.find(request.id) != nullptr) {
             event_sink(Event{RejectEvent{
                 request.id,
                 Operation::Submit,
@@ -158,9 +157,7 @@ public:
     // Cancel a live resting order.
     template <typename EventSink>
     void cancel(OrderId id, EventSink&& event_sink) {
-        auto index_it = order_index_.find(id);
-
-        if (index_it == order_index_.end()) {
+        if (order_index_.find(id) == nullptr) {
             event_sink(Event{RejectEvent{
                 id,
                 Operation::Cancel,
@@ -171,7 +168,7 @@ public:
 
         // This helper removes the order from its FIFO chain, ID index,
         // price-level total, bitmap if the level empties, and order pool.
-        remove_resting_order(index_it);
+        remove_resting_order(id);
 
         event_sink(Event{CancelAckEvent{id}});
     }
@@ -184,9 +181,9 @@ public:
         Quantity new_quantity,
         EventSink&& event_sink
     ) {
-        auto index_it = order_index_.find(id);
+        const OrderHandle* handle = order_index_.find(id);
 
-        if (index_it == order_index_.end()) {
+        if (handle == nullptr) {
             event_sink(Event{RejectEvent{
                 id,
                 Operation::Modify,
@@ -197,7 +194,7 @@ public:
 
         // Copy the original before any operation releases its slot.
         const OrderPool::OrderSlot original =
-            pool_[index_it->second.slot];
+            pool_[handle->slot];
 
         if (new_quantity == 0) {
             event_sink(Event{RejectEvent{
@@ -231,7 +228,7 @@ public:
 
                 // The slot and its prev/next links stay untouched, so FIFO
                 // position and sequence number are preserved.
-                pool_[index_it->second.slot].remaining_quantity =
+                pool_[handle->slot].remaining_quantity =
                     new_quantity;
             }
 
@@ -264,7 +261,7 @@ public:
 
         // The old slot is released here. The replacement can use that free
         // slot if some of its quantity must rest after matching.
-        remove_resting_order(index_it);
+        remove_resting_order(id);
 
         event_sink(Event{AckEvent{
             id,
@@ -274,7 +271,7 @@ public:
         match_and_rest(replacement, new_quantity, event_sink);
     }
 
-    // Build a canonical snapshot for comparisons with V0, V1 and V2.2.
+    // Build a canonical snapshot for comparisons with the other book versions.
     //
     // We enumerate live orders through the ID index, not through all 65,535
     // price slots. Sorting the copy hides the internal layout from callers.
@@ -283,19 +280,21 @@ public:
         std::vector<RestingOrderSnapshot> result;
         result.reserve(order_index_.size());
 
-        for (const auto& [id, handle] : order_index_) {
-            (void)id;
+        order_index_.for_each(
+            [&](OrderId id, const OrderHandle& handle) {
+                (void)id;
 
-            const auto& order = pool_[handle.slot];
+                const auto& order = pool_[handle.slot];
 
-            result.push_back(RestingOrderSnapshot{
-                order.id,
-                order.side,
-                order.price,
-                order.remaining_quantity,
-                order.sequence
-            });
-        }
+                result.push_back(RestingOrderSnapshot{
+                    order.id,
+                    order.side,
+                    order.price,
+                    order.remaining_quantity,
+                    order.sequence
+                });
+            }
+        );
 
         // Match the canonical order used by the other implementations:
         // bids descending, asks ascending, FIFO sequence within each level.
@@ -342,123 +341,147 @@ public:
         const Quantity maximum =
             std::numeric_limits<Quantity>::max();
 
-        // Start from each live ID entry and check that it leads to a valid
-        // active pool slot and a valid occupied level.
-        for (const auto& [id, handle] : order_index_) {
-            if (handle.slot >= pool_.capacity()
-                || !pool_.is_active(handle.slot)
-                || !range_.contains(handle.price)) {
-                return false;
+        // OrderIdMap exposes for_each() rather than standard iterators.
+        // A callback cannot return from check_invariants() directly, so the
+        // flag records a failure and prevents later entries from doing work.
+        bool entries_are_valid = true;
+
+        order_index_.for_each(
+            [&](OrderId id, const OrderHandle& handle) {
+                if (!entries_are_valid) {
+                    return;
+                }
+
+                // Start from each live ID entry and check that it leads to a
+                // valid active pool slot and a valid occupied level.
+                if (handle.slot >= pool_.capacity()
+                    || !pool_.is_active(handle.slot)
+                    || !range_.contains(handle.price)) {
+                    entries_are_valid = false;
+                    return;
+                }
+
+                const auto& order = pool_[handle.slot];
+
+                if (order.id != id
+                    || order.side != handle.side
+                    || order.price != handle.price
+                    || order.remaining_quantity == 0) {
+                    entries_are_valid = false;
+                    return;
+                }
+
+                const auto& levels = levels_for(handle.side);
+                const std::size_t level_index = index_for(handle.price);
+                const Level& level = levels[level_index];
+
+                if (!level.active
+                    || level.head == no_slot
+                    || level.tail == no_slot
+                    || !level_bit_is_set(handle.side, level_index)) {
+                    entries_are_valid = false;
+                    return;
+                }
+
+                // Compute the best prices independently of the cached values.
+                if (handle.side == Side::Buy) {
+                    if (!calculated_best_bid.has_value()
+                        || handle.price > *calculated_best_bid) {
+                        calculated_best_bid = handle.price;
+                    }
+                } else {
+                    if (!calculated_best_ask.has_value()
+                        || handle.price < *calculated_best_ask) {
+                        calculated_best_ask = handle.price;
+                    }
+                }
+
+                // Encode side and array index together, so bids and asks at
+                // the same numerical price count as distinct price levels.
+                const std::uint64_t level_key =
+                    static_cast<std::uint64_t>(level_index) * 2U
+                    + (handle.side == Side::Buy ? 0U : 1U);
+
+                // Several ID entries may point into one level; validate that
+                // level's complete intrusive list only once.
+                if (!visited_levels.insert(level_key).second) {
+                    return;
+                }
+
+                Quantity calculated_total = 0;
+                Sequence previous_sequence = 0;
+                Index previous_slot = no_slot;
+                Index cursor = level.head;
+
+                // Walk the FIFO chain from oldest to newest. The seen-slots
+                // set also detects a corrupt cyclic list.
+                while (cursor != no_slot) {
+                    if (cursor >= pool_.capacity()
+                        || !pool_.is_active(cursor)
+                        || !seen_slots.insert(cursor).second) {
+                        entries_are_valid = false;
+                        return;
+                    }
+
+                    const auto& current = pool_[cursor];
+
+                    if (current.side != handle.side
+                        || current.price != handle.price
+                        || current.remaining_quantity == 0
+                        || current.prev != previous_slot) {
+                        entries_are_valid = false;
+                        return;
+                    }
+
+                    if (current.sequence == 0
+                        || current.sequence >= next_sequence_
+                        || current.sequence <= previous_sequence) {
+                        entries_are_valid = false;
+                        return;
+                    }
+
+                    if (!seen_ids.insert(current.id).second
+                        || !seen_sequences.insert(current.sequence).second) {
+                        entries_are_valid = false;
+                        return;
+                    }
+
+                    // Each linked order must point back from the ID index to
+                    // the exact pool slot, not just the same ID or price.
+                    const OrderHandle* reverse = order_index_.find(current.id);
+
+                    if (reverse == nullptr
+                        || reverse->slot != cursor
+                        || reverse->side != current.side
+                        || reverse->price != current.price) {
+                        entries_are_valid = false;
+                        return;
+                    }
+
+                    if (current.remaining_quantity > maximum - calculated_total) {
+                        entries_are_valid = false;
+                        return;
+                    }
+
+                    calculated_total += current.remaining_quantity;
+                    ++counted_orders;
+
+                    previous_sequence = current.sequence;
+                    previous_slot = cursor;
+                    cursor = current.next;
+                }
+
+                // The final visited node must be the stored tail, and the
+                // calculated total must match the level aggregate.
+                if (previous_slot != level.tail
+                    || calculated_total != level.total_quantity) {
+                    entries_are_valid = false;
+                }
             }
+        );
 
-            const auto& order = pool_[handle.slot];
-
-            if (order.id != id
-                || order.side != handle.side
-                || order.price != handle.price
-                || order.remaining_quantity == 0) {
-                return false;
-            }
-
-            const auto& levels = levels_for(handle.side);
-            const std::size_t level_index = index_for(handle.price);
-            const Level& level = levels[level_index];
-
-            if (!level.active
-                || level.head == no_slot
-                || level.tail == no_slot
-                || !level_bit_is_set(handle.side, level_index)) {
-                return false;
-            }
-
-            // Compute the best prices independently of the cached values.
-            if (handle.side == Side::Buy) {
-                if (!calculated_best_bid.has_value()
-                    || handle.price > *calculated_best_bid) {
-                    calculated_best_bid = handle.price;
-                }
-            } else {
-                if (!calculated_best_ask.has_value()
-                    || handle.price < *calculated_best_ask) {
-                    calculated_best_ask = handle.price;
-                }
-            }
-
-            // Encode side and array index together, so bids and asks at the
-            // same numerical price count as distinct price levels.
-            const std::uint64_t level_key =
-                static_cast<std::uint64_t>(level_index) * 2U
-                + (handle.side == Side::Buy ? 0U : 1U);
-
-            // Several ID entries may point into one level; validate that
-            // level's complete intrusive list only once.
-            if (!visited_levels.insert(level_key).second) {
-                continue;
-            }
-
-            Quantity calculated_total = 0;
-            Sequence previous_sequence = 0;
-            Index previous_slot = no_slot;
-            Index cursor = level.head;
-
-            // Walk the FIFO chain from oldest to newest.
-            // The seen-slots set also detects a corrupt cyclic list.
-            while (cursor != no_slot) {
-                if (cursor >= pool_.capacity()
-                    || !pool_.is_active(cursor)
-                    || !seen_slots.insert(cursor).second) {
-                    return false;
-                }
-
-                const auto& current = pool_[cursor];
-
-                if (current.side != handle.side
-                    || current.price != handle.price
-                    || current.remaining_quantity == 0
-                    || current.prev != previous_slot) {
-                    return false;
-                }
-
-                if (current.sequence == 0
-                    || current.sequence >= next_sequence_
-                    || current.sequence <= previous_sequence) {
-                    return false;
-                }
-
-                if (!seen_ids.insert(current.id).second
-                    || !seen_sequences.insert(current.sequence).second) {
-                    return false;
-                }
-
-                // Each linked order must point back from the ID index to
-                // the exact pool slot, not just to the same ID or price.
-                const auto reverse_it = order_index_.find(current.id);
-
-                if (reverse_it == order_index_.end()
-                    || reverse_it->second.slot != cursor
-                    || reverse_it->second.side != current.side
-                    || reverse_it->second.price != current.price) {
-                    return false;
-                }
-
-                if (current.remaining_quantity > maximum - calculated_total) {
-                    return false;
-                }
-
-                calculated_total += current.remaining_quantity;
-                ++counted_orders;
-
-                previous_sequence = current.sequence;
-                previous_slot = cursor;
-                cursor = current.next;
-            }
-
-            // The final visited node must be the stored tail, and the
-            // independently calculated total must match the level aggregate.
-            if (previous_slot != level.tail
-                || calculated_total != level.total_quantity) {
-                return false;
-            }
+        if (!entries_are_valid) {
+            return false;
         }
 
         // The linked queues, ID index and pool must agree on live-order count.
@@ -536,7 +559,7 @@ private:
     // Resting order data and its intrusive prev/next links are stored here.
     OrderPool pool_;
 
-    // The index maps IDs to pool slot indices.
+    // Fixed-capacity index from IDs to pool slot handles.
     OrderIndex order_index_;
 
     Sequence next_sequence_{1};
@@ -767,10 +790,16 @@ private:
 
     // Unlink an order from its intrusive FIFO list.
     //
-    // The ID-index iterator becomes invalid when its entry is erased.
-    // The pool slot is released only after its links are no longer needed.
-    void remove_resting_order(OrderIndex::iterator index_it) {
-        const OrderHandle handle = index_it->second;
+    // Copy the handle before erasing the ID map entry, because erase()
+    // destroys the stored handle. The pool slot is released only after its
+    // links are no longer needed.
+    void remove_resting_order(OrderId id) {
+        const OrderHandle* found = order_index_.find(id);
+        if (found == nullptr) {
+            throw std::logic_error("Cannot remove an order absent from the ID map");
+        }
+
+        const OrderHandle handle = *found;
         const Index slot_index = handle.slot;
 
         auto& levels = levels_for(handle.side);
@@ -795,7 +824,9 @@ private:
         level.total_quantity -= slot.remaining_quantity;
 
         // The ID is no longer live after the node is removed.
-        order_index_.erase(index_it);
+        if (!order_index_.erase(id)) {
+            throw std::logic_error("Failed to erase a live order ID");
+        }
         --resting_order_count_;
 
         if (level.head == no_slot) {
@@ -850,6 +881,22 @@ private:
         slot.prev = level.tail;
         slot.next = no_slot;
 
+        // Register the ID before changing the visible level chain. If the map
+        // rejects insertion, return the slot so no partially linked order is
+        // left behind. Under normal operation this succeeds because the map
+        // capacity matches the pool capacity and IDs are checked on submit.
+        if (!order_index_.insert(id, OrderHandle{side, price, slot_index})) {
+            if (!pool_.release(slot_index)) {
+                throw std::logic_error(
+                    "Failed to release a slot after ID-map insertion failure"
+                );
+            }
+
+            throw std::logic_error(
+                "Duplicate ID or capacity limit reached in add_resting_order"
+            );
+        }
+
         // Append to the tail, preserving FIFO priority.
         if (level.tail == no_slot) {
             level.head = slot_index;
@@ -877,18 +924,6 @@ private:
             if (!best_ask_.has_value() || price < *best_ask_) {
                 best_ask_ = price;
             }
-        }
-
-        const auto [index_it, inserted] = order_index_.emplace(
-            id,
-            OrderHandle{side, price, slot_index}
-        );
-        (void)index_it;
-
-        if (!inserted) {
-            throw std::logic_error(
-                "Duplicate ID reached add_resting_order"
-            );
         }
 
         ++resting_order_count_;
@@ -943,7 +978,11 @@ private:
                     pool_[next_index].prev = no_slot;
                 }
 
-                order_index_.erase(maker.id);
+                if (!order_index_.erase(maker.id)) {
+                    throw std::logic_error(
+                        "Filled maker was missing from the ID map"
+                    );
+                }
                 --resting_order_count_;
 
                 if (level.head == no_slot) {
@@ -1045,13 +1084,13 @@ private:
         // For a cancel-and-replace modification, do not count the old order's
         // quantity if the replacement returns to the same price and side.
         if (excluded_id.has_value()) {
-            const auto old_it = order_index_.find(*excluded_id);
+            const OrderHandle* old_handle = order_index_.find(*excluded_id);
 
-            if (old_it != order_index_.end()
-                && old_it->second.side == request.side
-                && old_it->second.price == destination_price) {
+            if (old_handle != nullptr
+                && old_handle->side == request.side
+                && old_handle->price == destination_price) {
                 const Quantity old_quantity =
-                    pool_[old_it->second.slot].remaining_quantity;
+                    pool_[old_handle->slot].remaining_quantity;
 
                 if (old_quantity > existing_quantity) {
                     return true;

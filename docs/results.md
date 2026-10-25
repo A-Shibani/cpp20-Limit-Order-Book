@@ -184,5 +184,22 @@ unordered ID index can still allocate entries. The experiment therefore
 measures the pool and intrusive-list change, not a completely allocation-free
 engine.
 
-| V2.4 | Flat open-addressing ID map | Pending | Pending | Not implemented |
+## V2.4 throughput comparison against V2.2
+
+**Status:** Preliminary benchmark results; not a final performance claim.
+
+**Environment:** Intel Core i7-10510U (4 cores / 8 logical processors), Windows, MSVC 19.51.36260.0, x86 Release build.
+
+**Method:** Google Benchmark, 10 repetitions, 0.5-second minimum benchmark time, 2,000 operations per batch. The same deterministic workload kind and seed were used for each implementation. Workload generation, engine construction and initial-order loading were excluded from timed replay.
+
+| Workload | V2.2 median throughput | V2.4 median throughput | Speedup |
+|---|---:|---:|---:|
+| Balanced | 6.87921M ops/s | 12.5476M ops/s | 1.82x |
+| Crossing-heavy | 4.91713M ops/s | 7.60497M ops/s | 1.55x |
+| Cancel-heavy | 8.06309M ops/s | 13.3682M ops/s | 1.66x |
+
+These measurements show higher median throughput for V2.4 in all three tested workloads. Run-to-run variation remains, so treat the numbers as preliminary.
+
+**Interpretation limitation:** V2.2 and V2.4 differ in more than their ID lookup structures. V2.4 also uses the preallocated order pool and intrusive FIFO links. This comparison measures the implementations as a whole; it does not isolate the performance contribution of `OrderIdMap`.
+
 | V2.5 | Generation counters on handles | Pending | Pending | Not implemented |

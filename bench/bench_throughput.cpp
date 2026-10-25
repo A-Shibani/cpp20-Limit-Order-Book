@@ -1,30 +1,30 @@
-
 #include "lob/book_map.hpp"
 #include "lob/book_ref.hpp"
 #include "gen_workload.hpp"
 #include "lob/book_flat.hpp"
+#include "lob/book_pool.hpp"
 
 #include <benchmark/benchmark.h>
-#include "lob/book_pool.hpp"
-#include <type_traits>
+
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace {
-    
-    template <typename Book>
-    Book make_benchmark_book() {
-        // V2.3 needs a fixed order capacity. At most 128 initial orders plus
-        // 2,000 generated operations can introduce resting orders in one batch.
-        // A capacity of 4,096 leaves ample room for this workload.
-        if constexpr (std::is_same_v<Book, lob::BookPool>) {
-            return Book(4096);
-        } else {
-            // V0, V1 and V2.2 use their default constructors.
-            return Book{};
-        }
-    }
 
+// Construct each engine in the same way the benchmark expects.
+// BookPool has a fixed-capacity order pool, so give it an explicit capacity.
+template <typename Book>
+Book make_benchmark_book() {
+    // The generated batches contain 2,000 operations, plus up to 128 initial
+    // orders. A capacity of 4,096 leaves headroom for this benchmark workload.
+    if constexpr (std::is_same_v<Book, lob::BookPool>) {
+        return Book(4096);
+    } else {
+        // V0, V1 and V2.2 use their default constructors.
+        return Book{};
+    }
+}
 
 // Replay exactly the same pre-generated workload through whichever engine
 // type is supplied as the template argument.
@@ -37,8 +37,8 @@ void run_throughput_benchmark(
     const auto operation_count =
         static_cast<std::size_t>(state.range(0));
 
-    // Workload generation uses V0 as a model, but happens before the timer
-    // starts. Both engines get the same deterministic operation sequence.
+    // Generate the workload before timing starts. All implementations receive
+    // the same deterministic operation sequence for a given kind and seed.
     const lob::bench::Workload workload =
         lob::bench::generate_workload(
             kind,
@@ -51,16 +51,16 @@ void run_throughput_benchmark(
     for (auto _ : state) {
         (void)_;
 
-        // Setup is deliberately excluded from the measured replay:
-        // create a clean engine and load the identical initial orders.
+        // Exclude engine construction and initial-book loading from the timed
+        // section. This isolates the cost of replaying the operation sequence.
         state.PauseTiming();
 
         {
             Book book = make_benchmark_book<Book>();
             std::uint64_t event_count = 0;
 
-            // Count emitted events without allocating or storing them.
-            // Event delivery remains part of the measured operation.
+            // Count emitted events without storing them or allocating a vector.
+            // Event delivery itself remains part of the timed operation.
             const auto event_sink = [&event_count](const lob::Event&) {
                 ++event_count;
             };
@@ -69,12 +69,12 @@ void run_throughput_benchmark(
                 book.submit(order, event_sink);
             }
 
-            // Do not count the initial book's setup acknowledgements.
+            // Do not count acknowledgements produced while setting up the book.
             event_count = 0;
 
             state.ResumeTiming();
 
-            // This is the timed section: only replay the fixed operation list.
+            // This is the measured section: replay the fixed list of operations.
             for (const auto& operation : workload.operations) {
                 lob::bench::apply_workload_operation(
                     book,
@@ -83,18 +83,18 @@ void run_throughput_benchmark(
                 );
             }
 
-            // Prevent the compiler from treating the result as unused.
+            // Make the result observable to the compiler so useful work is not
+            // optimised away. ClobberMemory also acts as a compiler barrier.
             benchmark::DoNotOptimize(book);
             benchmark::DoNotOptimize(event_count);
             benchmark::ClobberMemory();
 
-            // Pause before aggregating counters and destroying the book.
+            // Pause before adding counters and destroying the engine object.
             state.PauseTiming();
             total_event_count += event_count;
         }
 
-        // The book has now been destroyed while timing was paused.
-        // Resume for the benchmark framework's next iteration.
+        // Resume the framework's timer for its next iteration.
         state.ResumeTiming();
     }
 
@@ -104,11 +104,11 @@ void run_throughput_benchmark(
     const std::int64_t total_operations =
         state.iterations() * operations_per_batch;
 
-    // Google Benchmark uses this to report operations per second.
+    // Google Benchmark reports this as throughput (operations per second).
     state.SetItemsProcessed(total_operations);
 
-    // A useful diagnostic that helps us see whether a workload is producing
-    // realistic activity or mostly producing rejected operations.
+    // This diagnostic helps identify workloads that emit unusually few or many
+    // events; it is not itself a performance metric.
     if (total_operations > 0) {
         state.counters["events_per_operation"] =
             static_cast<double>(total_event_count)
@@ -135,8 +135,7 @@ static void BM_V0_CancelHeavy(benchmark::State& state) {
     );
 }
 
-// V1 map-based benchmarks. The same workload kind and seed are used
-// as V0 so the operation trace is identical for each comparison.
+// V1 map-based benchmarks. They use the same workload kinds and seeds as V0.
 static void BM_V1_Balanced(benchmark::State& state) {
     run_throughput_benchmark<lob::BookMap>(
         state, lob::bench::WorkloadKind::Balanced, 1001
@@ -155,9 +154,8 @@ static void BM_V1_CancelHeavy(benchmark::State& state) {
     );
 }
 
-
+// V2.2: flat price arrays plus occupancy bitmaps and the existing ID map.
 static void BM_V2_2_Balanced(benchmark::State& state) {
-    // Use the same seed and workload kind as V0 and V1.
     run_throughput_benchmark<lob::BookFlat>(
         state, lob::bench::WorkloadKind::Balanced, 1001
     );
@@ -175,27 +173,29 @@ static void BM_V2_2_CancelHeavy(benchmark::State& state) {
     );
 }
 
-
-static void BM_V2_3_Balanced(benchmark::State& state) {
+// V2.4: BookPool now uses the custom fixed-capacity OrderIdMap instead of
+// std::unordered_map. These benchmark names intentionally say V2_4 so that
+// the measurements are not confused with the earlier V2.3 implementation.
+static void BM_V2_4_Balanced(benchmark::State& state) {
     run_throughput_benchmark<lob::BookPool>(
         state, lob::bench::WorkloadKind::Balanced, 1001
     );
 }
 
-static void BM_V2_3_CrossingHeavy(benchmark::State& state) {
+static void BM_V2_4_CrossingHeavy(benchmark::State& state) {
     run_throughput_benchmark<lob::BookPool>(
         state, lob::bench::WorkloadKind::CrossingHeavy, 1002
     );
 }
 
-static void BM_V2_3_CancelHeavy(benchmark::State& state) {
+static void BM_V2_4_CancelHeavy(benchmark::State& state) {
     run_throughput_benchmark<lob::BookPool>(
         state, lob::bench::WorkloadKind::CancelHeavy, 1003
     );
 }
 
-// Each batch replays 2,000 operations. We will start small, then increase
-// the workload size once the initial benchmark is working correctly.
+// Each batch replays 2,000 operations. Increase this later once the baseline
+// measurements and correctness checks are stable.
 BENCHMARK(BM_V0_Balanced)->Arg(2000)->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_V0_CrossingHeavy)->Arg(2000)->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_V0_CancelHeavy)->Arg(2000)->Unit(benchmark::kMillisecond);
@@ -208,9 +208,9 @@ BENCHMARK(BM_V2_2_Balanced)->Arg(2000)->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_V2_2_CrossingHeavy)->Arg(2000)->Unit(benchmark::kMillisecond);
 BENCHMARK(BM_V2_2_CancelHeavy)->Arg(2000)->Unit(benchmark::kMillisecond);
 
-BENCHMARK(BM_V2_3_Balanced)->Arg(2000)->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_V2_3_CrossingHeavy)->Arg(2000)->Unit(benchmark::kMillisecond);
-BENCHMARK(BM_V2_3_CancelHeavy)->Arg(2000)->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_V2_4_Balanced)->Arg(2000)->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_V2_4_CrossingHeavy)->Arg(2000)->Unit(benchmark::kMillisecond);
+BENCHMARK(BM_V2_4_CancelHeavy)->Arg(2000)->Unit(benchmark::kMillisecond);
 
 }  // namespace
 
