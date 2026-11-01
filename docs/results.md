@@ -3,10 +3,9 @@
 
 ## Status
 
-The throughput harness has been added. Results are pending the first
-Release benchmark run on the development machine.
-
-No performance claims should be made until measurements are collected.
+The throughput harness has been run in both x86 and x64 Release configurations.
+Results are preliminary and should be interpreted in the context of their
+recorded environments and run-to-run variability.
 
 ## Environment
 
@@ -202,4 +201,63 @@ These measurements show higher median throughput for V2.4 in all three tested wo
 
 **Interpretation limitation:** V2.2 and V2.4 differ in more than their ID lookup structures. V2.4 also uses the preallocated order pool and intrusive FIFO links. This comparison measures the implementations as a whole; it does not isolate the performance contribution of `OrderIdMap`.
 
-| V2.5 | Generation counters on handles | Pending | Pending | Not implemented |
+## x64 Release throughput measurements — 25 October 2026
+
+**Status: Preliminary.** These results extend the earlier x86 Release measurements with a native x64 Release build.
+
+**Implementation note:** The x64 benchmark was built from the V2.5 codebase.
+Consequently, the `BookPool` measurements include generation-aware handles.
+The benchmark registrations retain their historical `BM_V2_4_*` names.
+Therefore, the V2.4 row below represents the BookPool implementation with
+V2.5 changes, not a pure measurement of the earlier V2.4 implementation.
+
+### Environment and method
+
+- CPU reported by Google Benchmark: 8 logical processors at approximately 2.304 GHz. The system used for this project is an Intel Core i7-10510U.
+- OS: Windows.
+- Compiler: MSVC 19.51.36260.0.
+- Architecture: x64 Release.
+- Google Benchmark: v1.9.1.
+- Measurement: 10 repetitions per benchmark, with a minimum measurement time of 1 second.
+- Workloads: balanced, crossing-heavy, and cancel-heavy.
+- Batch size: 2,000 operations.
+- The benchmark reports throughput and event counters; these are throughput measurements, not latency percentiles.
+
+### Median throughput
+
+Throughput is reported in millions of items per second.
+
+| Version | Balanced | Crossing-heavy | Cancel-heavy |
+|---|---:|---:|---:|
+| V0 | 1.50879 | 4.71048 | 2.65260 |
+| V1 | 5.63507 | 6.02730 | 6.36498 |
+| V2.2 | 8.64973 | 6.06903 | 10.6644 |
+| V2.4* | 15.9580 | 7.42325 | 19.8462 |
+
+### Observed speedups
+
+V2.4* versus V0, calculated from median throughput:
+
+| Workload | Speedup |
+|---|---:|
+| Balanced | 10.58× |
+| Crossing-heavy | 1.58× |
+| Cancel-heavy | 7.48× |
+
+V2.4* versus V2.2:
+
+| Workload | Speedup |
+|---|---:|
+| Balanced | 1.85× |
+| Crossing-heavy | 1.22× |
+| Cancel-heavy | 1.86× |
+
+These are whole-implementation comparisons. V2.2 and V2.4 differ in multiple design choices, so the results do not isolate the effect of the custom order-ID map.
+
+### Variability and limitations
+
+Throughput CV was approximately 18.04% for V2.2 balanced, 20.73% for V2.2 crossing-heavy, and 16.32% for V2.4 balanced. Other workloads were less variable.
+
+Interpret the medians as observed measurements, not exact performance guarantees. The relatively high variation in some cases warrants caution when comparing small differences. No latency percentile claims are made by this throughput benchmark.
+
+Raw benchmark output: `docs/benchmark_x64_2026-10-25.json`.
