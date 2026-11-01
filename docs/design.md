@@ -1,7 +1,8 @@
 # Limit Order Book and Matching Engine — Design Specification
 
-**Status:** Initial specification, before implementation  
-**Language:** C++20  
+**Status:** Implemented through V2.5; this document records the
+behavioural specification and implementation design.
+**Language:** C++20
 **Core model:** Single instrument, single-threaded, deterministic, price-time priority
 
 ## 1. Goals and non-goals
@@ -10,7 +11,13 @@ The project answers: *How fast can a provably correct single-threaded limit orde
 
 Correctness comes first. A deliberately simple reference model (V0) is the behavioural oracle for a map-based baseline (V1) and a sequence of measured optimisations (V2).
 
-In scope: limit and market orders; partial fills; multi-level sweeps; cancel; modify; deterministic events and snapshots; invariant checks; seeded differential tests; sanitizers; reproducible throughput and latency benchmarks.
+Implemented scope: limit and market orders; partial fills; multi-level
+sweeps; cancel; modify; deterministic events and snapshots; invariant
+checks; seeded differential tests; reproducible Release throughput
+benchmarks.
+
+Sanitizer execution, per-operation latency measurements and low-level
+hardware profiling remain additional validation and measurement work.
 
 Out of scope for the core: multiple instruments, multithreading, floating-point prices, FIX, persistence, hidden/iceberg orders, stop orders, self-trade prevention, and exchange connectivity. A TCP server and Python bindings are stretch goals, not prerequisites.
 
@@ -131,15 +138,27 @@ Use an ordered price map per side, a FIFO queue of orders at each level, and an 
 
 ### V2 — measured optimisation ladder
 
-Start from a correctness-tested version, then introduce one change per commit/measurement:
+Each implementation preserves the matching semantics specified above.
 
-1. Replace ordered price maps with a flat array indexed by configured tick offset.
-2. Replace per-order heap nodes with a preallocated order pool, intrusive FIFO links, and a free list.
-3. Add a bitmap to locate the next non-empty price level using `std::countr_zero` / `std::countl_zero` where appropriate.
-4. Replace the standard live-ID map with a flat open-addressed hash table.
-5. Add generation counters to handles and test stale-handle protection explicitly.
+- **V2.2 — Flat price arrays and occupancy bitmaps:** Replace ordered
+  price maps with bounded flat price-level storage and bitmaps for
+  locating occupied levels.
 
-Each step must pass scenario tests, invariant checks, and differential tests before performance is measured. Preserve results even when an optimisation produces no improvement or regresses performance.
+- **V2.3 — Preallocated order pool:** Replace separately allocated
+  order nodes with a preallocated pool, intrusive FIFO links and a
+  free list. Retain the standard unordered live-order index.
+
+- **V2.4 — Custom order-ID map:** Replace the standard live-order
+  index with a fixed-capacity, open-addressed `OrderIdMap`.
+
+- **V2.5 — Generation-aware handles:** Associate pool handles with
+  generation counters so that a stale handle cannot refer to a
+  different order after its pool slot is reused. A slot is retired
+  rather than allowing its generation counter to wrap.
+
+Each stage must preserve the matching contract and pass scenario,
+invariant and differential tests. Benchmark results must identify
+the exact implementation being measured.
 
 ## 9. Correctness requirements
 
@@ -166,12 +185,32 @@ At minimum test:
 - invalid modify leaves the original order untouched;
 - zero quantity and out-of-range price rejection;
 - empty book and one-sided book cases.
+- pool allocation and release;
+- generation increments when a released pool slot is reused;
+- stale handles cannot release or modify a newer allocation;
+- exhausted pool behaviour;
+- generation-aware order-ID lookup and queue consistency.
 
 ### Differential tests
 
-Use seeded random operation streams, initially with approximate weights of 60% limit submit, 20% cancel, 10% modify, and 10% market submit. Use the same requests against V0 and V1, then V0 and V2. After every operation compare the full emitted event sequence and canonical snapshot. Run at least 10,000 deterministic seeds for the first milestone; make the seed and first mismatching operation easy to reproduce.
+Use deterministic seeded random operation streams. The normal
+differential test runs 500 seeds with 200 operations per seed,
+giving 100,000 generated operations.
 
-Generate valid and invalid operations intentionally, including missing IDs, duplicate live IDs, price boundaries, empty books, partial fills, and repeated ID lifecycles. Random tests supplement rather than replace hand-written scenarios.
+The same requests are replayed against V0, V1, V2.2 and the current
+V2.5 BookPool implementation. After every operation, compare the
+full emitted event sequence and canonical snapshot against V0.
+Check internal invariants in every implementation.
+
+The operation distribution is approximately 60% limit submit,
+20% cancel, 10% modify and 10% market submit. Generate valid and
+invalid operations intentionally, including missing IDs, duplicate
+live IDs, price boundaries, empty books, partial fills and repeated
+ID lifecycles. Failure output must identify the seed and first
+mismatching operation.
+
+Longer stress runs may be added separately; they are not part of
+the normal test-suite requirement.
 
 ### Invariants after every operation
 
@@ -182,10 +221,24 @@ Generate valid and invalid operations intentionally, including missing IDs, dupl
 - Order IDs are unique among live orders.
 - FIFO sequence order is increasing within every price level.
 - Sequence numbers are unique among live resting orders and originate from a monotonically increasing counter.
+- Every live pool-backed order handle must refer to the current
+  generation of its allocated pool slot.
 
 ## 10. Benchmarking and profiling
 
 Benchmark only Release builds, never sanitizer builds. The workload generator and event collection must not dominate the measured engine operation. Pre-generate operations and reserve output/event storage before timing.
+
+**Current measurement coverage:** Google Benchmark throughput
+measurements have been collected for balanced, crossing-heavy and
+cancel-heavy workloads in Release configurations. Repeated-run
+statistics are recorded in `docs/results.md`.
+
+The x64 BookPool benchmark was built from the V2.5 codebase. Its
+registrations retain historical `BM_V2_4_*` names; this distinction
+is documented in the results file.
+
+Per-operation latency percentiles, allocation counts and hardware
+performance-counter profiling remain future measurement extensions.
 
 Workloads:
 
@@ -209,14 +262,36 @@ The optimisation table records every step, the workload, repeated-run statistics
 
 - CMake 3.20 or newer; C++20 required.
 - GoogleTest and Google Benchmark may be acquired with CMake `FetchContent`.
-- Use GCC 12+ or Clang 15+ for the initial CI configuration. The build should also be made convenient for Windows development; WSL2/Linux is a reasonable route for the profiling stage.
-- Enable `-Wall -Wextra -Werror` (or corresponding compiler options) for project code.
-- Run AddressSanitizer and UndefinedBehaviorSanitizer in CI where supported. Keep sanitizer and benchmark configurations separate.
+- Windows development and testing use MSVC with CMake.
+- The CI workflow is configured for Ubuntu/GCC and sanitizer builds.
+  A successful remote CI run has not yet been recorded.
+- AddressSanitizer and UndefinedBehaviorSanitizer are supported by the
+  GCC/Clang CMake configuration, but sanitizer execution remains
+  outstanding.
+- Keep sanitizer and benchmark configurations separate.
 - Add deterministic tests and keep random seeds in failure output.
 - Keep performance results and commands reproducible in `docs/results.md` and the README.
 
 ## 12. Completion criteria
 
-Tier 1 is complete when the spec, V0, V1, scenario tests, invariants, seeded differential tests and reproducible V1 benchmark exist. Tier 2 is complete when V2 is correct and the optimisation ladder contains measured before-and-after data, including non-winning changes. Tier 3 (TCP server, bindings, BTC-calibrated workload) is explicitly deferred until after applications are underway.
+The core matching-engine implementation is complete through V2.5.
 
-No CV performance claim may be added until the corresponding number has been measured on a stated machine and can be reproduced from the repository.
+Completed:
+- V0 reference and V1 map-based implementations.
+- V2.2 flat/bitmap implementation.
+- V2.3 preallocated order pool and intrusive FIFO.
+- V2.4 custom fixed-capacity order-ID map.
+- V2.5 generation-aware handles.
+- Hand-written scenarios and invariant tests.
+- 500-seed differential testing across four implementations.
+- Repeated Release throughput measurements and documented results.
+- Windows Debug and x64 Release test suites, with 66 tests passing.
+
+Outstanding extensions:
+- Local or remote sanitizer validation.
+- Per-operation latency measurements.
+- Allocation and hardware-counter profiling.
+- Additional performance isolation experiments.
+
+Tier 3 (TCP server, Python bindings and BTC-calibrated workload) remains
+deferred until after applications are underway.

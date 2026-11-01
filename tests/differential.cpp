@@ -83,7 +83,8 @@ void apply_operation(
 
 // Compare two engines after every operation, not merely at the end.
 // This localises a divergence to its first operation.
-TEST(DifferentialTests, BookMapMatchesReferenceOverSeededStreams) {
+TEST(DifferentialTests, AllImplementationsMatchReferenceOverSeededStreams) {
+
     constexpr std::uint64_t seed_count = 500;
     constexpr int operations_per_seed = 200;
 
@@ -165,10 +166,10 @@ TEST(DifferentialTests, BookMapMatchesReferenceOverSeededStreams) {
 
             apply_operation(reference, operation, reference_events);
             apply_operation(candidate, operation, candidate_events);
-            // Apply the identical input to V2.1. All engines receive the same
+            // Apply the identical input to V2.2. All engines receive the same
             // operation, so any difference in events or state is significant.
             apply_operation(flat_candidate, operation, flat_events);
-            // Send the exact same operation to V2.3.
+            // Send the exact same operation to V2.5.
             // The pool implementation must produce identical observable behaviour.
             apply_operation(pool_candidate, operation, pool_events);
 
@@ -182,10 +183,9 @@ TEST(DifferentialTests, BookMapMatchesReferenceOverSeededStreams) {
                     << ", quantity=" << quantity;
             }
 
-            // V2.1 must emit the same ordered events as the reference engine.
             if (reference_events != flat_events) {
                 FAIL()
-                    << "V0/V2.1 event mismatch: seed=" << seed
+                    << "V0/V2.2 event mismatch: seed=" << seed
                     << ", step=" << step
                     << ", id=" << id
                     << ", price=" << price
@@ -206,7 +206,7 @@ TEST(DifferentialTests, BookMapMatchesReferenceOverSeededStreams) {
             // order priority, side, price, IDs and sequence numbers.
             if (reference.snapshot() != flat_candidate.snapshot()) {
                 FAIL()
-                    << "V0/V2.1 snapshot mismatch: seed=" << seed
+                    << "V0/V2.2 snapshot mismatch: seed=" << seed
                     << ", step=" << step
                     << ", id=" << id
                     << ", price=" << price
@@ -216,7 +216,7 @@ TEST(DifferentialTests, BookMapMatchesReferenceOverSeededStreams) {
             // All implementations must emit the same events in the same order.
             if (reference_events != pool_events) {
                 FAIL()
-                    << "V0/V2.3 event mismatch: seed=" << seed
+                    << "V0/5 event mismatch: seed=" << seed
                     << ", step=" << step
                     << ", id=" << id
                     << ", price=" << price
@@ -226,7 +226,7 @@ TEST(DifferentialTests, BookMapMatchesReferenceOverSeededStreams) {
             // Compare logical resting orders, not internal pool slot indices.
             if (reference.snapshot() != pool_candidate.snapshot()) {
                 FAIL()
-                    << "V0/V2.3 snapshot mismatch: seed=" << seed
+                    << "V0/V2.5 snapshot mismatch: seed=" << seed
                     << ", step=" << step
                     << ", id=" << id
                     << ", price=" << price
@@ -236,7 +236,7 @@ TEST(DifferentialTests, BookMapMatchesReferenceOverSeededStreams) {
             // The pool's own links, ID index, bitmap and quantity totals must agree.
             if (!pool_candidate.check_invariants()) {
                 FAIL()
-                    << "V2.3 invariant failure: seed=" << seed
+                    << "V2.5 invariant failure: seed=" << seed
                     << ", step=" << step;
             }
 
@@ -255,7 +255,7 @@ TEST(DifferentialTests, BookMapMatchesReferenceOverSeededStreams) {
 
             if (!flat_candidate.check_invariants()) {
                 FAIL()
-                    << "V2.1 invariant failure: seed=" << seed
+                    << "V2.2 invariant failure: seed=" << seed
                     << ", step=" << step;
             }
         }
