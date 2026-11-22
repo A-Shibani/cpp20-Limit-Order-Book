@@ -64,14 +64,16 @@ and event callbacks. It excludes workload generation and initial book setup.
   modification targets. Differential tests remain the correctness check.
 - The result depends on the CPU, compiler, build flags and workload.
 
-## Optimisation ladder
+## Early implementation tracking (historical)
 
-This section will be expanded after we establish the V1 baseline.
+This table records the initial implementation and measurement plan.
+Its original pending entries have been superseded by the measured
+results documented in the sections below.
 
-| Version | Change | Workload | Throughput delta | Notes |
-|---|---|---|---:|---|
-| V0 | Vector-based reference model | Pending | Pending | Baseline |
-| V1 | Ordered price maps, FIFO lists, ID index | Pending | Pending | To be measured |
+| Version | Change | Workload | Measurement status | Notes |
+|---|---|---|---|---|
+| V0 | Vector-based reference model | All three workloads | Measured | Reference baseline |
+| V1 | Ordered price maps, FIFO lists, ID index | All three workloads | Measured | Compared against V0 |
 
 ## V2.1 — Flat price-level array (18 October 2026)
 

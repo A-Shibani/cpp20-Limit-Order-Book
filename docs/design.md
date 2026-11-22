@@ -263,11 +263,12 @@ The optimisation table records every step, the workload, repeated-run statistics
 - CMake 3.20 or newer; C++20 required.
 - GoogleTest and Google Benchmark may be acquired with CMake `FetchContent`.
 - Windows development and testing use MSVC with CMake.
-- The CI workflow is configured for Ubuntu/GCC and sanitizer builds.
-  A successful remote CI run has not yet been recorded.
-- AddressSanitizer and UndefinedBehaviorSanitizer are supported by the
-  GCC/Clang CMake configuration, but sanitizer execution remains
-  outstanding.
+- GitHub Actions runs the test suite on Ubuntu using GCC.
+- AddressSanitizer and UndefinedBehaviorSanitizer are enabled in the
+  CI configuration.
+- A successful sanitizer CI run was verified on 22 November 2026.
+- Sanitizer validation covers the GCC/Linux configuration; the local
+  MSVC build has not been independently sanitizer-tested.
 - Keep sanitizer and benchmark configurations separate.
 - Add deterministic tests and keep random seeds in failure output.
 - Keep performance results and commands reproducible in `docs/results.md` and the README.

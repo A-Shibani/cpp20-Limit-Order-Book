@@ -186,6 +186,13 @@ For single-configuration generators, the executable may instead be located direc
 
 Do not compare measurements from different architectures or build configurations as though they were directly interchangeable.
 
+## Technical report
+
+[Read the full C++20 Limit Order Book technical report](docs/technical-report.pdf)
+
+The report covers the architecture, matching semantics, optimisation
+progression, correctness testing and benchmark results.
+
 ## Repository structure
 
 ```text
@@ -197,6 +204,7 @@ Do not compare measurements from different architectures or build configurations
 │   ├── bench_throughput.cpp
 │   └── gen_workload.hpp
 ├── docs/
+│   ├── benchmark_x64_2026-10-25.json
 │   ├── design.md
 │   └── results.md
 ├── include/
